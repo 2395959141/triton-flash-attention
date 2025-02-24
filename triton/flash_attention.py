@@ -24,17 +24,18 @@ def _attn_fwd_inner(
     # range of values handled by this stage
     if STAGE == 1:
         # From 0 to the left of the diagonal
-        lo, hi = 0, block_index_q * BLOCK_SIZE_Q
+        lo, hi = 0, block_index_q * BLOCK_SIZE_Q #! 计算没有被mask的部分
     elif STAGE == 2:
         # Used only for the block in which there is transition between non-masked and masked keys
-        lo, hi = block_index_q * BLOCK_SIZE_Q, (block_index_q + 1) * BLOCK_SIZE_Q
+        lo, hi = block_index_q * BLOCK_SIZE_Q, (block_index_q + 1) * BLOCK_SIZE_Q #! 计算对角线上的值
         lo = tl.multiple_of(lo, BLOCK_SIZE_Q)
     else:
         # Only used for non-causal attention
-        lo, hi = 0, SEQ_LEN
+        lo, hi = 0, SEQ_LEN #! 计算整个序列（没有mask的情况）
 
-    K_block_ptr = tl.advance(K_block_ptr, (0, lo))
-    V_block_ptr = tl.advance(V_block_ptr, (lo, 0))
+    #! 指向循环的第一个位置
+    K_block_ptr = tl.advance(K_block_ptr, (0, lo)) #* 在序列维度移动lo步（shape为[HEAD_DIM, SEQ_LEN]）
+    V_block_ptr = tl.advance(V_block_ptr, (lo, 0)) #* 在序列维度移动lo步（shape为[HEAD_DIM, SEQ_LEN]）
 
     # loop over k, v and update accumulator
     for start_kv in range(lo, hi, BLOCK_SIZE_KV):
@@ -43,10 +44,10 @@ def _attn_fwd_inner(
 
         # -- compute qk ----
         K_block = tl.load(K_block_ptr)
-        QK_block = tl.dot(Q_block, K_block)
+        QK_block = tl.dot(Q_block, K_block) #! K已经转置过了
 
         if STAGE == 2:
-            mask = offs_q[:, None] >= (start_kv + offs_kv[None, :])
+            mask = offs_q[:, None] >= (start_kv + offs_kv[None, :]) #! 所有Q索引大于K索引 都被MASK掉
             QK_block = QK_block * softmax_scale + tl.where(mask, 0, -1.0e6)
             m_ij = tl.maximum(m_i, tl.max(QK_block, 1))
             QK_block -= m_ij[:, None]
@@ -58,12 +59,12 @@ def _attn_fwd_inner(
         # Compute the exponential of each dot product, so now we are computing exp(qk_ij - m_ij)
         P_block = tl.math.exp(QK_block)
         # Compute the sum by rows of the attention scores
-        l_ij = tl.sum(P_block, 1)
+        l_ij = tl.sum(P_block, 1) #! 当前Block中的每行sum归一化因子
 
         # This is the correction factor for the previous l_i
-        alpha = tl.math.exp(m_i - m_ij)
+        alpha = tl.math.exp(m_i - m_ij) #! 使用当前的最大值修改 上一个Block中的结果
         # Apply the correction factor to the previous l_i and add the new l_ij
-        l_i = l_i * alpha + l_ij
+        l_i = l_i * alpha + l_ij #! 更新归一化因子
 
         V_block = tl.load(V_block_ptr)
         P_block = P_block.to(tl.float16)
@@ -71,7 +72,7 @@ def _attn_fwd_inner(
         O_block = O_block * alpha[:, None]
         O_block = tl.dot(P_block, V_block, O_block)
 
-        m_i = m_ij
+        m_i = m_ij #! m_i 是上一次迭代中的最大值
 
         # Move to the next block of K and V
         V_block_ptr = tl.advance(V_block_ptr, (BLOCK_SIZE_KV, 0))
@@ -95,9 +96,9 @@ def _attn_fwd_inner(
 )
 @triton.jit
 def _attn_fwd(
-    Q,  # BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM
-    K,  # BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM
-    V,  # BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM
+    Q,  # BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM  #! 索引到[index_batch, index_head, :, :]
+    K,  # BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM  
+    V,
     softmax_scale,
     M,  # BATCH_SIZE, NUM_HEADS, SEQ_LEN
     O,  # BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM
@@ -127,41 +128,46 @@ def _attn_fwd(
 ):
     tl.static_assert(BLOCK_SIZE_KV <= HEAD_DIM)
 
+    #! 对应于Triton grid的启动维度：[ triton.cdiv(SEQ_LEN, args["BLOCK_SIZE_Q"]), BATCH_SIZE * NUM_HEADS ]
     # This indicate which block in the sequence length to process
-    block_index_q = tl.program_id(0)
+    block_index_q = tl.program_id(0) #* triton.cdiv(SEQ_LEN, args["BLOCK_SIZE_Q"])
 
     # This indicates which head and batch to process. Each program is associated with a single head of a single batch
-    index_batch_head = tl.program_id(1)
+    index_batch_head = tl.program_id(1) #* BATCH_SIZE * NUM_HEADS
     # This indicate which batch this program is associated with (each batch has NUM_HEADS heads)
-    index_batch = index_batch_head // NUM_HEADS
+    index_batch = index_batch_head // NUM_HEADS #* 在哪个Batch中
     # This indicate the position of the head in the batch
-    index_head = index_batch_head % NUM_HEADS
+    index_head = index_batch_head % NUM_HEADS #* 在哪个head注意力头上
 
     # This allows to get the (N_CTX, HEAD_DIM) block in the Q, K, V by selecting indexing it by batch and head
     qvk_offset = (
         index_batch.to(tl.int64) * stride_Q_batch
         + index_head.to(tl.int64) * stride_Q_head
     )
-
+    #* 下面定义的每个张量， 都会定位到正确的batch 和 head维度
+    #! 对于Query部分会跳过一些block, 每个程序处理一个不同的查询块
+    #! 对于Key和Value部分，每个程序遍历所有的键值
+    #! 创建了一个指针，指向 batch 中的 head 的正确索引
     Q_block_ptr = tl.make_block_ptr(
-        base=Q + qvk_offset,
-        shape=(SEQ_LEN, HEAD_DIM),
-        strides=(stride_Q_seq, stride_Q_dim),
-        offsets=(block_index_q * BLOCK_SIZE_Q, 0),
-        block_shape=(BLOCK_SIZE_Q, HEAD_DIM),
+        base=Q + qvk_offset,  #* Q[index_batch, index_head, :, :]  BLock的内存起始地址
+        shape=(SEQ_LEN, HEAD_DIM),  #* 逻辑结构
+        strides=(stride_Q_seq, stride_Q_dim), #* shape中每个维度在内存中的跨步（元素数量为单位）
+        offsets=(block_index_q * BLOCK_SIZE_Q, 0), #*  Block加载多少数据 
+        block_shape=(BLOCK_SIZE_Q, HEAD_DIM),  #* 定义数据块的逻辑分块粒度
         order=(1, 0),
     )
 
-    V_block_ptr = tl.make_block_ptr(
+    V_block_ptr = tl.make_block_ptr( #* V[index_batch, index_head, :, :]
         base=V + qvk_offset,
         shape=(SEQ_LEN, HEAD_DIM),
         strides=(stride_V_seq, stride_V_dim),
-        offsets=(0, 0),
+        offsets=(0, 0), #! 选取一个block中的 seq_len 和 head_size的所有元素
         block_shape=(BLOCK_SIZE_KV, HEAD_DIM),
         order=(1, 0),
     )
-
-    K_block_ptr = tl.make_block_ptr(
+    
+    #! 这里K需要转置，因为QK_block = Q @ K.T    体现在shape，block_shape 和 order中
+    K_block_ptr = tl.make_block_ptr( #* K[index_batch, index_head, :, :]
         base=K + qvk_offset,
         shape=(HEAD_DIM, SEQ_LEN),
         strides=(
@@ -173,7 +179,8 @@ def _attn_fwd(
         order=(0, 1),
     )
 
-    O_block_ptr = tl.make_block_ptr(
+    #!  输出的block形状和Q的block形状一样
+    O_block_ptr = tl.make_block_ptr(   #* O[index_batch, index_head, block_index_q * BLOCK_SIZE_Q, :]
         base=O + qvk_offset,
         shape=(SEQ_LEN, HEAD_DIM),
         strides=(stride_O_seq, stride_O_dim),
@@ -182,25 +189,35 @@ def _attn_fwd(
         order=(1, 0),
     )
 
+    #! 前面定义好了，这里就可以通过索引来访问了
     # offs_q: the offsets for the tokens in the Q to process
+    #! 对应的 head 处理的那部分 query token 索引 
     offs_q = block_index_q * BLOCK_SIZE_Q + tl.arange(0, BLOCK_SIZE_Q)
     # offs_kv: the offsets for the tokens in the K and V sequence to process
+    #! 按照block_size_kv 来遍历key 和 value
     offs_kv = tl.arange(0, BLOCK_SIZE_KV)
 
+
+    #* 处理不含归一化的softmax* 所需要的参数
     # m_i: the running maximum. We have one for each query
     m_i = tl.zeros([BLOCK_SIZE_Q], dtype=tl.float32) - float("inf")
     # l_i: the running sum. We have one for each query (as we sum the attention scores by rows)
     l_i = tl.zeros([BLOCK_SIZE_Q], dtype=tl.float32) + 1.0
     # acc: the accumulator for the output, which is a group of rows of the O matrix
+    #!  BLOCK_SIZE_Q行， 完整的 HEAD_DIM 列
     O_block = tl.zeros([BLOCK_SIZE_Q, HEAD_DIM], dtype=tl.float32)
 
     # load the blocks of Q: it will stay in SRAM throughout
+    #! 循环中一个Q_block 跟所有的K_block 和 V_block 做运算。
+    #! 所以要在下面的内循环前面 对 每个Block load 一次 Q
     Q_block = tl.load(Q_block_ptr)
 
     # Stage: 3 if causal, else 1
 
     if STAGE == 1 or STAGE == 3:
         # This step runs for non-causal attention or for the blocks to the left of the diagonal in the causal attention
+        #! 统一处理casual 和 非 casual情况。 无论哪种情况，先计算causal那部分
+        #! 如果是非 casual 情况， 则再把attention mask掉的那部分计算一遍，就得到了完整的attention输出
         O_block, l_i, m_i = _attn_fwd_inner(
             O_block,
             l_i,
@@ -427,6 +444,7 @@ def _attn_bwd_dk_dv(
     M += offset_batch_head_seq
     D += offset_batch_head_seq
 
+    #! 对应于Triton内核启动的维度  []
     # load scales
     offs_dim = tl.arange(0, HEAD_DIM)
 
@@ -520,7 +538,7 @@ class TritonAttention(torch.autograd.Function):
         HEAD_DIM_Q, HEAD_DIM_K = Q.shape[-1], K.shape[-1]
         HEAD_DIM_V = V.shape[-1]
 
-        BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM = Q.shape
+        BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM = Q.shape #* 每个FlashAttention内部处理 [SEQ_LEN, HEAD_DIM]维度
 
         assert HEAD_DIM_Q == HEAD_DIM_K and HEAD_DIM_K == HEAD_DIM_V
 
@@ -528,23 +546,24 @@ class TritonAttention(torch.autograd.Function):
         stage = 3 if causal else 1
 
         grid = lambda args: (
-            triton.cdiv(SEQ_LEN, args["BLOCK_SIZE_Q"]),
-            BATCH_SIZE * NUM_HEADS,
+            triton.cdiv(SEQ_LEN, args["BLOCK_SIZE_Q"]), #! 在一个序列上的哪一组Query , Q有多少Block
+            BATCH_SIZE * NUM_HEADS, #! 在哪个Batch中的哪个head注意力头上，每个Batch 都有NUM_HEADS个head
             1,
         )
 
+        #! 反向传播需要每一行最大值 和 归一化因子
         # M is the logsumexp for the backward pass, one for each query
         M = torch.empty(
             (BATCH_SIZE, NUM_HEADS, SEQ_LEN), device=Q.device, dtype=torch.float32
         )
 
         _attn_fwd[grid](
-            Q=Q,
+            Q=Q, 
             K=K,
             V=V,
             softmax_scale=softmax_scale,
-            M=M,
-            O=O,
+            M=M, #! 为反向传播保存的信息
+            O=O, #* 输出
             stride_Q_batch=Q.stride(0),
             stride_Q_head=Q.stride(1),
             stride_Q_seq=Q.stride(2),
@@ -716,6 +735,6 @@ def test_op(BATCH_SIZE, NUM_HEADS, SEQ_LEN, HEAD_DIM, causal, dtype=torch.float1
 
 
 if __name__ == "__main__":
-    test_op(BATCH_SIZE=8, NUM_HEADS=16, SEQ_LEN=4096, HEAD_DIM=64, causal=True)
-    test_op(BATCH_SIZE=8, NUM_HEADS=16, SEQ_LEN=4096, HEAD_DIM=64, causal=False)
+    test_op(BATCH_SIZE=8, NUM_HEADS=16, SEQ_LEN=1024, HEAD_DIM=64, causal=True)
+    test_op(BATCH_SIZE=8, NUM_HEADS=16, SEQ_LEN=1024, HEAD_DIM=64, causal=False)
     print("PASSED")
